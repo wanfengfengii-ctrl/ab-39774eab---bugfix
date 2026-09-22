@@ -54,6 +54,9 @@ class ZipLoadedSet(LoadedSet):
     def _name_index_path(self) -> str:
         return ""  # unused
 
+    def _rev_index_path(self) -> str:
+        return ""  # no sidecars exist inside a package ZIP
+
     def _subject_name_index(self) -> dict[bytes, list[str]]:
         import base64 as b64
 
@@ -61,6 +64,15 @@ class ZipLoadedSet(LoadedSet):
         for name_b64, digests in self.store._name_index.items():
             idx[b64.b64decode(name_b64)] = digests
         return idx
+
+    # The verifier has no database (so no sidecar anchors can exist) and the
+    # ZIP is read-only: every revocation object is always taken through the
+    # exact eager blob path, and no self-heal writes are attempted.
+    def _heal_name_sidecar(self, idx) -> None:
+        pass
+
+    def _heal_rev_sidecar(self) -> None:
+        pass
 
 
 def _fail(checks, name, ok, detail=""):

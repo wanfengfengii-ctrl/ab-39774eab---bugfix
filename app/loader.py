@@ -17,17 +17,28 @@ from the sidecar and never even reads an unrelated revocation DER after a
 restart, instance switch or adjudication-cache miss. Richer checks (IDP
 distribution point, onlyContains, certID hashes, signatures, validity
 windows) still run through the full parser during adjudication, so verdicts
-and evidence dispositions are identical to eager parsing. If the sidecar is
-absent or does not exactly cover the sealed universe (stores sealed before
-sidecars, or the offline package verifier), the loader falls back to exact
-eager parsing.
+and evidence dispositions are identical to eager parsing.
+
+The sidecars are acceleration hints, never authority: the SHA-256 of their
+exact canonical bytes is recorded in the sealed database row
+(``sidecar_anchors`` — storage independent of the hint files). A cold read
+accepts a sidecar only when its bytes match the anchor and its rows both
+exactly cover the sealed universe and are structurally well formed. If the
+sidecar is absent, truncated, corrupt, has any scope/verdict value replaced,
+or the store predates anchors (old sealed sets / offline package review),
+the loader falls back to exact eager parsing of the sealed blobs and then
+self-heals the sidecar and anchor. Tampering with the auxiliary scope
+information therefore cannot change a sealed verdict: the result always
+matches a full re-parse byte-for-byte.
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 
+from . import canonical
 from . import evidence as ev
 from . import metrics as _metrics
 from .certmodel import ParsedCert, parse_certificate
@@ -35,6 +46,66 @@ from .errors import MalformedEvidenceError, UnsupportedError
 from .graph import CertGraph
 
 REV_INDEX_VERSION = 1
+
+
+def build_name_index(cert_digests: list[str], get_blob) -> dict[str, list[str]]:
+    """Seal-time cheap subject-name index: raw Name DER (base64) -> digests.
+
+    Shared by sealing and by the cold-start self-heal migration so both emit
+    byte-identical sidecars."""
+    from .certmodel import cheap_names
+    from .errors import MalformedEvidenceError as _MEE
+
+    name_index: dict[str, list[str]] = {}
+    for digest in cert_digests:
+        try:
+            _issuer, subject = cheap_names(get_blob(digest))
+        except _MEE:
+            continue
+        name_index.setdefault(base64.b64encode(subject).decode(), []).append(digest)
+    return name_index
+
+
+def build_revocation_index(crls: list[dict], ocsps: list[dict],
+                           get_blob) -> tuple[dict, int]:
+    """Fully parse every revocation object once and build the scope/profile
+    sidecar. Returns ``(index, total_crl_entries)``. Deterministic: callers
+    pass the SHA-sorted sealed content lists, so the canonical bytes are
+    identical across instances, restarts and the self-heal migration."""
+    import base64 as _b64
+
+    from cryptography import x509 as _x509
+
+    rev_index = {"version": REV_INDEX_VERSION, "crls": [], "ocsps": []}
+    total_entries = 0
+    for x in crls:
+        digest = x["sha256"]
+        raw = get_blob(digest)
+        # Entry-count resource limit (a structurally unloadable CRL fails
+        # here, exactly as before lazy materialization).
+        total_entries += len(_x509.load_der_x509_crl(raw))
+        obj, problem = ev.review_crl(raw, x["received_at"])
+        if problem is not None:
+            rev_index["crls"].append(
+                {"s": digest, "i": None, "a": None, "e": 1, "p": problem})
+        else:
+            scope = ev.crl_scope_from_obj(obj)
+            rev_index["crls"].append({
+                "s": digest,
+                "i": _b64.b64encode(scope.issuer_name).decode(),
+                "a": _b64.b64encode(scope.aki).decode()
+                if scope.aki is not None else None, "e": 0})
+    for x in ocsps:
+        digest = x["sha256"]
+        obj, problem = ev.review_ocsp(get_blob(digest), x["received_at"])
+        if problem is not None:
+            rev_index["ocsps"].append(
+                {"s": digest, "n": None, "e": 1, "p": problem})
+        else:
+            scope = ev.ocsp_scope_from_obj(obj)
+            rev_index["ocsps"].append(
+                {"s": digest, "n": sorted(scope.serials), "e": 0})
+    return rev_index, total_entries
 
 
 class LoadedSet:
@@ -157,25 +228,55 @@ class LoadedSet:
 
     def _subject_name_index(self) -> dict[bytes, list[str]]:
         """Use the cheap index materialized at seal time (raw Name DER keys,
-        base64 encoded in the sidecar file)."""
+        base64 encoded in the sidecar file).
+
+        The sidecar is a pure acceleration hint: its canonical bytes are
+        anchored to the sealed manifest at seal time (``sidecar_anchors`` in
+        the database row). A missing/truncated/corrupt/replaced sidecar — or a
+        store sealed before anchors existed — is rebuilt from blobs (slow path
+        for old stores only), so tampering can never hide a certificate."""
         cached = getattr(self, "_name_idx", None)
         if cached is not None:
             return cached
         idx_path = self._name_index_path()
+        raw_index = self._read_anchored_sidecar(
+            idx_path, "nameindex")
         idx: dict[bytes, list[str]] = {}
-        if os.path.exists(idx_path):
-            with open(idx_path) as f:
-                raw_index = json.load(f)
-            for name_b64, digests in raw_index.items():
-                idx[base64.b64decode(name_b64)] = digests
-        else:
-            # Slow fallback for stores sealed before sidecars existed.
+        if raw_index is not None:
+            try:
+                for name_b64, digests in raw_index.items():
+                    idx[base64.b64decode(name_b64)] = digests
+            except (ValueError, TypeError):
+                # Illegal base64 inside an otherwise byte-valid sidecar:
+                # rebuild rather than trust damaged rows.
+                idx = {}
+                raw_index = None
+        if raw_index is None:
+            # Slow path: stores sealed before sidecars/anchors existed, or a
+            # damaged sidecar. Parse reachable issuers/all certs as required.
             for d in self.content["certificates"]:
                 pc = self.cert(d)
                 if pc is not None:
                     idx.setdefault(pc.subject_der, []).append(d)
+            self._heal_name_sidecar(idx)
+        for v in idx.values():
+            v.sort()
         self._name_idx = idx
         return idx
+
+    def _heal_name_sidecar(self, idx: dict[bytes, list[str]]) -> None:
+        """Persist a freshly rebuilt name sidecar (and its anchor) so the next
+        cold process is fast again. Never fatal on an unwritable volume."""
+        try:
+            name_index = {base64.b64encode(k).decode(): v
+                          for k, v in idx.items()}
+            data = canonical.dumps(name_index)
+            self._write_sidecar(self._name_index_path(), data)
+            self.store.anchor_sidecar(
+                self.manifest["evidence_set_id"], "nameindex",
+                hashlib.sha256(data).hexdigest())
+        except Exception:
+            pass
 
     def _name_index_path(self) -> str:
         return os.path.join(self.store.root, "packages",
@@ -190,19 +291,35 @@ class LoadedSet:
         self._ocsp_received = {x["sha256"]: x["received_at"]
                                for x in self.content.get("ocsps", [])}
         sidecar = self._load_rev_index_sidecar()
-        if sidecar is not None and self._sidecar_covers_universe(sidecar):
+        if (sidecar is not None
+                and self._sidecar_covers_universe(sidecar)
+                and self._sidecar_rows_well_formed(sidecar)):
             try:
                 self._apply_rev_sidecar(sidecar)
             except Exception:
-                # Corrupt row content: reset and use the exact eager path.
+                # Corrupt row content: drop sidecar-carried dispositions and
+                # rebuild via the exact eager path (certificate parse problems
+                # are unrelated and must be preserved).
                 self._crl_by_issuer = {}
                 self._ocsp_by_serial = {}
+                self._crl_cache = {d: v for d, v in self._crl_cache.items()
+                                   if d not in self._crl_received}
+                self._ocsp_cache = {d: v for d, v in self._ocsp_cache.items()
+                                    if d not in self._ocsp_received}
+                self.parse_problems = [
+                    p for p in self.parse_problems
+                    if not ((p["kind"] == "crl"
+                             and p["sha256"] in self._crl_received)
+                            or (p["kind"] == "ocsp"
+                                and p["sha256"] in self._ocsp_received))]
                 self._build_rev_index_from_blobs()
         else:
-            # Missing/stale/partial sidecar (stores sealed before sidecars
-            # existed, or offline package review): exact eager parse, which
+            # Missing/stale/partial/tampered sidecar (stores sealed before
+            # sidecars existed, a digest mismatch against the sealed anchor,
+            # or the offline package review): exact eager parse, which
             # reproduces the original dispositions byte-for-byte.
             self._build_rev_index_from_blobs()
+            self._heal_rev_sidecar()
         for v in self._crl_by_issuer.values():
             v.sort()
         for v in self._ocsp_by_serial.values():
@@ -244,6 +361,123 @@ class LoadedSet:
         return (side_crls == set(self._crl_received)
                 and side_ocsps == set(self._ocsp_received))
 
+    @staticmethod
+    def _sidecar_rows_well_formed(sidecar: dict) -> bool:
+        """Structural validation of every row before any scope value is
+        trusted: valid-flag rows carry decodable base64 scope fields (CRL
+        issuer Name/AKI, OCSP serial list), rejected rows carry the seal-time
+        verdict. Anything odd (wrong types, duplicate rows, bad encodings)
+        rejects the whole sidecar and routes through exact eager parsing."""
+        try:
+            crl_rows = sidecar["crls"]
+            ocsp_rows = sidecar["ocsps"]
+            if not isinstance(crl_rows, list) or not isinstance(ocsp_rows, list):
+                return False
+            seen_crls: set[str] = set()
+            for row in crl_rows:
+                if not isinstance(row, dict) or row.get("s") in seen_crls:
+                    return False
+                seen_crls.add(row["s"])
+                if row.get("e"):
+                    if not isinstance(row.get("p"), dict):
+                        return False
+                    continue
+                if not isinstance(row.get("i"), str):
+                    return False
+                base64.b64decode(row["i"], validate=True)
+                if row.get("a") is not None:
+                    if not isinstance(row["a"], str):
+                        return False
+                    base64.b64decode(row["a"], validate=True)
+            seen_ocsps: set[str] = set()
+            for row in ocsp_rows:
+                if not isinstance(row, dict) or row.get("s") in seen_ocsps:
+                    return False
+                seen_ocsps.add(row["s"])
+                if row.get("e"):
+                    if not isinstance(row.get("p"), dict):
+                        return False
+                    continue
+                serials = row.get("n")
+                if not isinstance(serials, list):
+                    return False
+                if any(not isinstance(n, int) or isinstance(n, bool)
+                       or n < 0 for n in serials):
+                    return False
+                if len(set(serials)) != len(serials):
+                    return False
+        except (ValueError, TypeError, KeyError):
+            return False
+        return True
+
+    def _read_anchored_sidecar(self, path: str, kind: str):
+        """Read and JSON-parse a sidecar file only when its canonical bytes
+        match the seal-time anchor recorded in the database manifest
+        (``sidecar_anchors``). Returns the parsed object, or ``None`` when the
+        file is absent/truncated/corrupt/replaced, when the store predates
+        anchors, or when the backing store cannot provide an anchor.
+
+        Anchoring covers *every* byte of the file — JSON syntax, version, all
+        digests and all scope/verdict fields — so replacing any issuer/AKI/
+        serial/verdict value with otherwise legal content is detected."""
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return None
+        anchors = self._sidecar_anchors()
+        if anchors is None or kind not in anchors:
+            # Store sealed before anchors existed: do not trust an unanchored
+            # hint byte-for-byte; let the caller take its slow fallback.
+            return None
+        if hashlib.sha256(raw).hexdigest() != anchors[kind]:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def _sidecar_anchors(self) -> dict | None:
+        cached = getattr(self, "_sidecar_anchor_cache", "unset")
+        if cached != "unset":
+            return cached
+        try:
+            row = self.store.get_set(self.manifest["evidence_set_id"])
+            anchors = json.loads(row["sidecar_anchors"]) \
+                if row["sidecar_anchors"] else {}
+        except Exception:
+            return None
+        if not isinstance(anchors, dict):
+            anchors = None
+        self._sidecar_anchor_cache = anchors
+        return anchors
+
+    @staticmethod
+    def _write_sidecar(path: str, data: bytes) -> None:
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def _heal_rev_sidecar(self) -> None:
+        """After an exact eager rebuild (tampered/legacy sidecar), persist the
+        freshly computed index and anchor it, so the next cold process is fast
+        again. The rebuilt index derives solely from the sealed, content-
+        addressed blobs and is therefore identical to the seal-time bytes."""
+        try:
+            rev_index, _entries = build_revocation_index(
+                self.content.get("crls", []), self.content.get("ocsps", []),
+                self.get_blob)
+            data = canonical.dumps(rev_index)
+            self._write_sidecar(self._rev_index_path(), data)
+            self.store.anchor_sidecar(
+                self.manifest["evidence_set_id"], "revindex",
+                hashlib.sha256(data).hexdigest())
+        except Exception:
+            pass
+
     def _record_rev_problem(self, kind: str, digest: str,
                             problem: dict | None) -> None:
         if any(p["sha256"] == digest and p["kind"] == kind
@@ -264,13 +498,8 @@ class LoadedSet:
                             f"{self.manifest['evidence_set_id']}.revindex.json")
 
     def _load_rev_index_sidecar(self) -> dict | None:
-        path = self._rev_index_path()
-        if not os.path.exists(path):
-            return None
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
+        data = self._read_anchored_sidecar(self._rev_index_path(), "revindex")
+        if data is None:
             return None
         if data.get("version") != REV_INDEX_VERSION:
             return None

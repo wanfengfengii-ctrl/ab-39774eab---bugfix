@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS sets (
     created_request_id TEXT,
     content_digest TEXT,
     manifest_json TEXT,
-    sealed_at INTEGER
+    sealed_at INTEGER,
+    sidecar_anchors TEXT                 -- {kind: sha256 of canonical sidecar bytes}
 );
 CREATE TABLE IF NOT EXISTS items (
     set_id TEXT NOT NULL,
@@ -55,6 +56,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_adj_unique
     ON adjudications(set_id, request_digest);
 """
 
+# Columns added after the first release; applied in-place to volumes created
+# by older builds (SQLite has no "ADD COLUMN IF NOT EXISTS").
+_COLUMN_MIGRATIONS = (
+    ("sets", "sidecar_anchors", "TEXT"),
+)
+
 
 class Store:
     def __init__(self, root: str):
@@ -81,6 +88,13 @@ class Store:
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA wal_autocheckpoint=1000")
         self._conn.executescript(SCHEMA)
+        # In-place migrations for volumes created by older builds.
+        for table, column, decl in _COLUMN_MIGRATIONS:
+            cols = {r["name"] for r in self._conn.execute(
+                f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         self._conn.commit()
 
     def close(self):
@@ -124,6 +138,34 @@ class Store:
 
     def package_path(self, package_id: str) -> str:
         return os.path.join(self.root, "packages", package_id + ".zip")
+
+    @staticmethod
+    def _atomic_write_bytes(path: str, data: bytes) -> None:
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def anchor_sidecar(self, set_id: str, kind: str, digest: str) -> None:
+        """Record/refresh the seal-time anchor for a lazily built sidecar
+        during the cold-read self-heal (legacy or damaged sidecars). Only a
+        sealed row is touched; the manifest/content digest never change."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sidecar_anchors FROM sets WHERE id=?", (set_id,)).fetchone()
+            if row is None:
+                return
+            anchors = json.loads(row["sidecar_anchors"]) \
+                if row["sidecar_anchors"] else {}
+            if anchors.get(kind) == digest:
+                return
+            anchors[kind] = digest
+            self._conn.execute(
+                "UPDATE sets SET sidecar_anchors=? WHERE id=?",
+                (canonical.dumps(anchors).decode("utf-8"), set_id))
+            self._conn.commit()
 
     # ---------------------------------------------------------- idempotency
     def idempotent(self, scope: str, request_id: str, normalized: dict):
@@ -275,62 +317,16 @@ class Store:
                                         {"limit": "crl_ocsp_evidence", "max": 2_000,
                                          "actual": n_rev})
                 # Cheap subject-name index for lazy graph construction.
-                import base64
+                from .loader import build_name_index, build_revocation_index
 
-                from .certmodel import cheap_names
-                from .errors import MalformedEvidenceError
-
-                name_index: dict[str, list[str]] = {}
-                for x in groups["certificate"]:
-                    d = x["sha256"]
-                    try:
-                        _issuer, subject = cheap_names(self.get_blob(d))
-                    except MalformedEvidenceError:
-                        continue
-                    name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
+                name_index = build_name_index(
+                    [x["sha256"] for x in groups["certificate"]], self.get_blob)
                 # Revocation scope + profile-verdict index, built once at seal
                 # by fully parsing each object. A cold process later reads
                 # only this sidecar to bound scope, so unrelated revocation
                 # DERs need never be re-read/re-parsed after restart.
-                import base64 as _b64
-
-                from cryptography import x509 as _x509
-
-                from . import evidence as _ev
-                from .loader import REV_INDEX_VERSION
-
-                rev_index = {"version": REV_INDEX_VERSION, "crls": [], "ocsps": []}
-                total_revocation_entries = 0
-                for x in groups["crl"]:
-                    digest = x["sha256"]
-                    raw = self.get_blob(digest)
-                    # Entry-count resource limit (a structurally unloadable
-                    # CRL fails here, exactly as before lazy materialization).
-                    total_revocation_entries += len(
-                        _x509.load_der_x509_crl(raw))
-                    obj, problem = _ev.review_crl(raw, x["received_at"])
-                    if problem is not None:
-                        rev_index["crls"].append(
-                            {"s": digest, "i": None, "a": None, "e": 1,
-                             "p": problem})
-                    else:
-                        scope = _ev.crl_scope_from_obj(obj)
-                        rev_index["crls"].append({
-                            "s": digest,
-                            "i": _b64.b64encode(scope.issuer_name).decode(),
-                            "a": _b64.b64encode(scope.aki).decode()
-                            if scope.aki is not None else None, "e": 0})
-                for x in groups["ocsp"]:
-                    digest = x["sha256"]
-                    obj, problem = _ev.review_ocsp(
-                        self.get_blob(digest), x["received_at"])
-                    if problem is not None:
-                        rev_index["ocsps"].append(
-                            {"s": digest, "n": None, "e": 1, "p": problem})
-                    else:
-                        scope = _ev.ocsp_scope_from_obj(obj)
-                        rev_index["ocsps"].append(
-                            {"s": digest, "n": sorted(scope.serials), "e": 0})
+                rev_index, total_revocation_entries = build_revocation_index(
+                    groups["crl"], groups["ocsp"], self.get_blob)
                 if total_revocation_entries > 1_000_000:
                     raise ConflictError("resource limit exceeded",
                                         {"limit": "revocation_entries", "max": 1_000_000,
@@ -351,27 +347,36 @@ class Store:
                                "revocation_entries": total_revocation_entries},
                 }
                 manifest["content_digest"] = canonical.sha256_hex(content)
+                # Cryptographic anchors of every sidecar byte. The anchors
+                # live in the sealed database row (independent storage from
+                # the JSON hint files), so a missing/truncated/corrupt or
+                # content-replaced sidecar is detected on the next cold read
+                # and forces the exact eager blob path.
+                import hashlib as _hashlib
+
+                name_bytes = canonical.dumps(name_index)
+                rev_bytes = canonical.dumps(rev_index)
+                anchors = {
+                    "nameindex": _hashlib.sha256(name_bytes).hexdigest(),
+                    "revindex": _hashlib.sha256(rev_bytes).hexdigest(),
+                }
                 self._conn.execute(
                     "UPDATE sets SET state='sealed', content_digest=?,"
-                    " manifest_json=?, sealed_at=strftime('%s','now') WHERE id=?",
+                    " manifest_json=?, sealed_at=strftime('%s','now'),"
+                    " sidecar_anchors=? WHERE id=?",
                     (manifest["content_digest"],
-                     canonical.dumps(manifest).decode("utf-8"), set_id))
+                     canonical.dumps(manifest).decode("utf-8"),
+                     canonical.dumps(anchors).decode("utf-8"), set_id))
                 self._conn.commit()
                 # Subject-name index sidecar (content-addressed in set dir).
                 import os as _os
 
                 idx_path = _os.path.join(self.root, "packages", f"{set_id}.nameindex.json")
-                tmp = idx_path + ".tmp"
-                with open(tmp, "w") as f:
-                    f.write(canonical.dumps(name_index).decode("utf-8"))
-                _os.replace(tmp, idx_path)
+                self._atomic_write_bytes(idx_path, name_bytes)
                 # Revocation scope index sidecar (lazy materialization).
                 rev_path = _os.path.join(
                     self.root, "packages", f"{set_id}.revindex.json")
-                tmp = rev_path + ".tmp"
-                with open(tmp, "w") as f:
-                    f.write(canonical.dumps(rev_index).decode("utf-8"))
-                _os.replace(tmp, rev_path)
+                self._atomic_write_bytes(rev_path, rev_bytes)
                 return manifest
             except Exception:
                 self._conn.rollback()
