@@ -280,14 +280,14 @@ class Store:
                 from .certmodel import cheap_names
                 from .errors import MalformedEvidenceError
 
-                name_index: dict[str, list[str]] = {}
+                name_rows: dict[str, list[str]] = {}
                 for x in groups["certificate"]:
                     d = x["sha256"]
                     try:
                         _issuer, subject = cheap_names(self.get_blob(d))
                     except MalformedEvidenceError:
                         continue
-                    name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
+                    name_rows.setdefault(base64.b64encode(subject).decode(), []).append(d)
                 # Revocation scope + profile-verdict index, built once at seal
                 # by fully parsing each object. A cold process later reads
                 # only this sidecar to bound scope, so unrelated revocation
@@ -297,7 +297,7 @@ class Store:
                 from cryptography import x509 as _x509
 
                 from . import evidence as _ev
-                from .loader import REV_INDEX_VERSION
+                from .loader import NAME_INDEX_VERSION, REV_INDEX_VERSION
 
                 rev_index = {"version": REV_INDEX_VERSION, "crls": [], "ocsps": []}
                 total_revocation_entries = 0
@@ -336,6 +336,21 @@ class Store:
                                         {"limit": "revocation_entries", "max": 1_000_000,
                                          "actual": total_revocation_entries})
 
+                # Versioned sidecar envelopes. These are derived caches; their
+                # exact bytes are digested and the digests are anchored in the
+                # sealed manifest below so any later substitution/truncation
+                # is detected on load and forces exact eager re-parsing.
+                name_index = {"version": NAME_INDEX_VERSION, "names": name_rows}
+                name_index_bytes = canonical.dumps(name_index)
+                rev_index_bytes = canonical.dumps(rev_index)
+
+                import hashlib as _hashlib
+
+                sidecar_digests = {
+                    "name_index": _hashlib.sha256(name_index_bytes).hexdigest(),
+                    "rev_index": _hashlib.sha256(rev_index_bytes).hexdigest(),
+                }
+
                 content = {
                     "certificates": [x["sha256"] for x in groups["certificate"]],
                     "crls": groups["crl"],
@@ -349,6 +364,7 @@ class Store:
                                "crls": len(content["crls"]),
                                "ocsps": len(content["ocsps"]),
                                "revocation_entries": total_revocation_entries},
+                    "sidecars": sidecar_digests,
                 }
                 manifest["content_digest"] = canonical.sha256_hex(content)
                 self._conn.execute(
@@ -357,20 +373,26 @@ class Store:
                     (manifest["content_digest"],
                      canonical.dumps(manifest).decode("utf-8"), set_id))
                 self._conn.commit()
-                # Subject-name index sidecar (content-addressed in set dir).
+                # Sidecar files (content-addressed in set dir), written
+                # atomically AFTER the manifest carrying their digests is
+                # durable. A missing file simply triggers the eager path.
                 import os as _os
 
                 idx_path = _os.path.join(self.root, "packages", f"{set_id}.nameindex.json")
                 tmp = idx_path + ".tmp"
-                with open(tmp, "w") as f:
-                    f.write(canonical.dumps(name_index).decode("utf-8"))
+                with open(tmp, "wb") as f:
+                    f.write(name_index_bytes)
+                    f.flush()
+                    _os.fsync(f.fileno())
                 _os.replace(tmp, idx_path)
                 # Revocation scope index sidecar (lazy materialization).
                 rev_path = _os.path.join(
                     self.root, "packages", f"{set_id}.revindex.json")
                 tmp = rev_path + ".tmp"
-                with open(tmp, "w") as f:
-                    f.write(canonical.dumps(rev_index).decode("utf-8"))
+                with open(tmp, "wb") as f:
+                    f.write(rev_index_bytes)
+                    f.flush()
+                    _os.fsync(f.fileno())
                 _os.replace(tmp, rev_path)
                 return manifest
             except Exception:

@@ -17,14 +17,29 @@ from the sidecar and never even reads an unrelated revocation DER after a
 restart, instance switch or adjudication-cache miss. Richer checks (IDP
 distribution point, onlyContains, certID hashes, signatures, validity
 windows) still run through the full parser during adjudication, so verdicts
-and evidence dispositions are identical to eager parsing. If the sidecar is
-absent or does not exactly cover the sealed universe (stores sealed before
-sidecars, or the offline package verifier), the loader falls back to exact
-eager parsing.
+and evidence dispositions are identical to eager parsing.
+
+Sidecar trust model
+-------------------
+The sidecars are *derived caches*, never evidence: they are not part of the
+sealed content digest and live outside the database. Their scope values
+(issuer Name/AKI, CertID serials, seal-time parse verdicts) therefore carry
+no authority. A v2 sidecar is cryptographically bound to the sealed set: its
+exact canonical bytes are digested and the expected digest is stored inside
+the sealed, database-backed manifest (``manifest["sidecars"]``). Any
+missing, truncated, corrupt, structurally invalid or substituted sidecar —
+including one whose digest set still covers the sealed universe but whose
+scope *values* were replaced — fails authentication and forces the exact
+eager blob path, which reproduces the original verdict byte-for-byte. Stores
+sealed before v2 (no authenticated digest in the manifest) likewise use the
+eager path, so old sealed sets, cold starts and multi-instance reads keep
+their original conclusions.
 """
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
 import json
 import os
 
@@ -34,7 +49,8 @@ from .certmodel import ParsedCert, parse_certificate
 from .errors import MalformedEvidenceError, UnsupportedError
 from .graph import CertGraph
 
-REV_INDEX_VERSION = 1
+REV_INDEX_VERSION = 2
+NAME_INDEX_VERSION = 2
 
 
 class LoadedSet:
@@ -157,19 +173,40 @@ class LoadedSet:
 
     def _subject_name_index(self) -> dict[bytes, list[str]]:
         """Use the cheap index materialized at seal time (raw Name DER keys,
-        base64 encoded in the sidecar file)."""
+        base64 encoded in the sidecar file).
+
+        The sidecar is an untrusted cache: it is used only when its exact
+        bytes authenticate against the digest sealed in the manifest. Any
+        mismatch or structural problem falls back to the exact eager parse."""
         cached = getattr(self, "_name_idx", None)
         if cached is not None:
             return cached
-        idx_path = self._name_index_path()
-        idx: dict[bytes, list[str]] = {}
-        if os.path.exists(idx_path):
-            with open(idx_path) as f:
-                raw_index = json.load(f)
-            for name_b64, digests in raw_index.items():
-                idx[base64.b64decode(name_b64)] = digests
-        else:
-            # Slow fallback for stores sealed before sidecars existed.
+        idx: dict[bytes, list[str]] | None = None
+        data = self._read_authenticated_sidecar(
+            self._name_index_path(), "name_index")
+        if data is not None:
+            try:
+                doc = json.loads(data)
+                if not isinstance(doc, dict) or doc.get("version") != NAME_INDEX_VERSION:
+                    raise ValueError("bad name index version")
+                entries = doc.get("names")
+                if not isinstance(entries, dict):
+                    raise ValueError("bad name index shape")
+                candidate: dict[bytes, list[str]] = {}
+                for name_b64, digests in entries.items():
+                    if not isinstance(digests, list) or not all(
+                            isinstance(x, str) for x in digests):
+                        raise ValueError("bad name index row")
+                    candidate[base64.b64decode(name_b64)] = digests
+                idx = candidate
+            except (ValueError, TypeError, binascii.Error):
+                idx = None  # authentic envelope, unusable body -> eager path
+        if idx is None:
+            # Exact fallback for missing/unauthenticated/unusable sidecars:
+            # stores sealed before sidecar authentication, a tampered cache,
+            # or the offline package reviewer. Parsing every cert reproduces
+            # the exact graph candidate order byte-for-byte.
+            idx = {}
             for d in self.content["certificates"]:
                 pc = self.cert(d)
                 if pc is not None:
@@ -194,20 +231,36 @@ class LoadedSet:
             try:
                 self._apply_rev_sidecar(sidecar)
             except Exception:
-                # Corrupt row content: reset and use the exact eager path.
-                self._crl_by_issuer = {}
-                self._ocsp_by_serial = {}
+                # Corrupt row content despite an authentic envelope: discard
+                # every sidecar-derived revocation state and rebuild it
+                # entirely from blobs, so the result is byte-identical to a
+                # pure eager load.
+                self._reset_revocation_state()
                 self._build_rev_index_from_blobs()
         else:
-            # Missing/stale/partial sidecar (stores sealed before sidecars
-            # existed, or offline package review): exact eager parse, which
-            # reproduces the original dispositions byte-for-byte.
+            # Missing/truncated/corrupt/unauthenticated/stale sidecar (stores
+            # sealed before sidecar authentication, a substituted scope cache,
+            # or offline package review): exact eager parse, which reproduces
+            # the original dispositions byte-for-byte.
             self._build_rev_index_from_blobs()
         for v in self._crl_by_issuer.values():
             v.sort()
         for v in self._ocsp_by_serial.values():
             v.sort()
         self._rev_index_loaded = True
+
+    def _reset_revocation_state(self) -> None:
+        """Drop all revocation-derived scope/cache/parse state (e.g. half of
+        a sidecar application that turned out unusable), keeping certificate
+        parse problems untouched. The eager blob rebuild then starts clean."""
+        self._crl_by_issuer = {}
+        self._ocsp_by_serial = {}
+        self._crl_cache = {}
+        self._ocsp_cache = {}
+        self.crls = {}
+        self.ocsps = {}
+        self.parse_problems = [p for p in self.parse_problems
+                               if p["kind"] not in ("crl", "ocsp")]
 
     def _apply_rev_sidecar(self, sidecar: dict) -> None:
         for row in sidecar.get("crls", []):
@@ -263,18 +316,51 @@ class LoadedSet:
         return os.path.join(self.store.root, "packages",
                             f"{self.manifest['evidence_set_id']}.revindex.json")
 
-    def _load_rev_index_sidecar(self) -> dict | None:
-        path = self._rev_index_path()
-        if not os.path.exists(path):
+    def _expected_sidecar_digest(self, name: str) -> str | None:
+        """The seal-time digest of a sidecar's exact bytes, anchored in the
+        sealed database manifest. ``None`` for stores sealed before sidecar
+        authentication (force the eager fallback)."""
+        return (self.manifest.get("sidecars") or {}).get(name)
+
+    def _read_authenticated_sidecar(self, path: str, name: str) -> bytes | None:
+        """Return a sidecar's bytes only when they authenticate against the
+        digest sealed in the manifest. Missing, truncated, corrupt or
+        substituted files yield ``None``; the caller then uses the exact
+        eager blob path, so a tampered cache can never alter a verdict.
+
+        Authentication is deliberately over the *raw file bytes as sealed*
+        (canonical JSON written atomically at seal), not over a re-serialized
+        parse, so truncation and byte-level corruption are always detected.
+        """
+        expected = self._expected_sidecar_digest(name)
+        if not expected:
             return None
         try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
             return None
-        if data.get("version") != REV_INDEX_VERSION:
+        if not data:
+            return None
+        if hashlib.sha256(data).hexdigest() != expected:
             return None
         return data
+
+    def _load_rev_index_sidecar(self) -> dict | None:
+        data = self._read_authenticated_sidecar(
+            self._rev_index_path(), "rev_index")
+        if data is None:
+            return None
+        try:
+            doc = json.loads(data)
+        except ValueError:
+            return None
+        if not isinstance(doc, dict) or doc.get("version") != REV_INDEX_VERSION:
+            return None
+        if not isinstance(doc.get("crls"), list) or not isinstance(
+                doc.get("ocsps"), list):
+            return None
+        return doc
 
     def _build_rev_index_from_blobs(self) -> None:
         """Fallback for stores sealed before revocation sidecars existed and
